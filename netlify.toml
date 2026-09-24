@@ -1,0 +1,26 @@
+# =============================================================
+# netlify.toml — Controle TCU · AFCE
+# Plano gratuito Netlify (Starter)
+# =============================================================
+
+[build]
+  # Projeto é HTML puro — sem etapa de build.
+  # O Netlify serve o arquivo diretamente do repositório.
+  publish = "."
+
+# Redireciona todas as rotas para o HTML principal (SPA fallback)
+[[redirects]]
+  from   = "/*"
+  to     = "/Controle_TCU.html"
+  status = 200
+
+# Cabeçalhos de segurança recomendados para HTTPS em produção
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options        = "SAMEORIGIN"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy        = "strict-origin-when-cross-origin"
+    Permissions-Policy     = "camera=(), microphone=(), geolocation=()"
+    # Content-Security-Policy — ajuste o domínio do Supabase após criar o projeto:
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com https://cdn.jsdelivr.net https://esm.sh; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co;"

@@ -36,10 +36,12 @@
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.min.js"></script>
 <!-- Supabase SDK — carregado como módulo ESM e exposto globalmente -->
-<script type="module">
-  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-  // Expõe createClient para o script Babel abaixo
-  window.__supabaseCreateClient = createClient;
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+  // Expõe createClient no mesmo namespace que o resto do código espera
+  window.__supabaseCreateClient = (window.supabase && window.supabase.createClient)
+    ? window.supabase.createClient
+    : null;
 </script>
 <style>
   html { scroll-behavior: smooth; }
@@ -342,16 +344,16 @@ async function saveStateToCloud(userId, state) {
   }
 }
 
-// Debounce para não disparar saves a cada keystroke
-function debounce(fn, delay) {
-  let timer;
-  return (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), delay);
-  };
+// Debounce especializado para o save na nuvem com callback de status
+function debouncedSaveToCloud(userId, state, setStatus) {
+  if (debouncedSaveToCloud._timer) clearTimeout(debouncedSaveToCloud._timer);
+  debouncedSaveToCloud._timer = setTimeout(function() {
+    saveStateToCloud(userId, state)
+      .then(function(ok) { if (setStatus) setStatus(ok ? 'saved' : 'error'); })
+      .catch(function()  { if (setStatus) setStatus('error'); });
+  }, 1500);
 }
-
-const debouncedSaveToCloud = debounce(saveStateToCloud, 1500);
+debouncedSaveToCloud._timer = null;
 
 
 
@@ -2701,16 +2703,15 @@ function App() {
     return unsubscribe;
   }, []);
 
-  // Persistência dupla: localStorage (sempre) + Supabase (se logado)
+  // Persistência dupla: localStorage (sempre) + Supabase (se logado, com debounce)
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
     catch (e) { console.error('Erro ao salvar no localStorage', e); }
 
     if (currentUser) {
       setSyncStatus('syncing');
-      debouncedSaveToCloud(currentUser.id, state)
-        .then(ok => setSyncStatus(ok ? 'saved' : 'error'))
-        .catch(() => setSyncStatus('error'));
+      // debouncedSaveToCloud agenda o save; o status é atualizado dentro do debounce
+      debouncedSaveToCloud(currentUser.id, state, setSyncStatus);
     }
   }, [state, currentUser]);
 
@@ -4203,7 +4204,6 @@ function App() {
           </div>
         </div>
       )}
-    </div>
 
       {/* Modal de Login / Cadastro — Supabase Auth */}
       {showAuthModal && SUPABASE_CONFIGURED && (

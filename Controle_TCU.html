@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8" />
@@ -307,53 +307,365 @@ function supabaseOnAuthChange(callback) {
 }
 
 /* ============================= SUPABASE SYNC ============================= */
-// Carrega estado do Supabase (cloud) com fallback para localStorage (offline/deslogado)
+// Identificador estável deste aparelho (usado nos backups da nuvem)
+function getDeviceInfo() {
+  let id = null;
+  try { id = localStorage.getItem('tcu_device_id'); } catch (e) {}
+  if (!id) {
+    id = 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    try { localStorage.setItem('tcu_device_id', id); } catch (e) {}
+  }
+  const ua = navigator.userAgent || '';
+  const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iPod/i.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'macOS' : /Linux/i.test(ua) ? 'Linux' : 'Outro';
+  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
+  return { id: id, label: br + ' · ' + os };
+}
+
+// Payload salvo na nuvem = estado + catálogo de matérias (usado pelo e-mail semanal no servidor)
+function buildCloudPayload(state) {
+  const all = [...INITIAL_SYLLABUS, ...(state.customDisciplines || []), ...BUILTIN_EXTRA_DISCIPLINES];
+  const seen = {};
+  const disciplines = [];
+  all.forEach(d => {
+    if (seen[d.id]) return;
+    seen[d.id] = true;
+    const meta = getDisciplineMeta(d.id, state.customMetas);
+    disciplines.push({ id: d.id, name: d.name, sigla: meta.sigla, color: meta.color });
+  });
+  return Object.assign({}, state, {
+    _meta: {
+      disciplines: disciplines,
+      contestName: (state.settings && state.settings.contestName) || '',
+      savedAt: new Date().toISOString(),
+      device: getDeviceInfo().label,
+    },
+  });
+}
+
+function hasMeaningfulData(state) {
+  if (!state) return false;
+  if (Array.isArray(state.activities) && state.activities.length > 0) return true;
+  const t = state.topics || {};
+  return Object.keys(t).some(k => t[k] && (t[k].teoria || t[k].revisao || t[k].feitas > 0));
+}
+
+// Lê o estado salvo no servidor. Retorna { ok, row } — row = null se o usuário ainda não tem dados.
 async function loadStateFromCloud(userId) {
   const sb = getSupabase();
-  if (!sb || !userId) return null;
+  if (!sb || !userId) return { ok: false, row: null };
   try {
     const { data, error } = await sb
       .from('user_state')
-      .select('payload')
+      .select('payload, updated_at')
       .eq('user_id', userId)
       .maybeSingle();
     if (error) throw error;
-    return data?.payload || null;
+    return { ok: true, row: data || null };
   } catch (e) {
-    console.warn('[Supabase] Falha ao carregar estado da nuvem, usando local.', e);
-    return null;
+    console.warn('[Supabase] Falha ao carregar estado da nuvem.', e);
+    return { ok: false, row: null };
   }
 }
 
-// Salva estado no Supabase (upsert — cria ou atualiza a linha do usuário)
+// Salva (upsert) o estado no servidor. Retorna { ok, updated_at }.
 async function saveStateToCloud(userId, state) {
   const sb = getSupabase();
-  if (!sb || !userId) return false;
+  if (!sb || !userId) return { ok: false };
   try {
-    const { error } = await sb
+    const { data, error } = await sb
       .from('user_state')
-      .upsert(
-        { user_id: userId, payload: state },
-        { onConflict: 'user_id' }
-      );
+      .upsert({ user_id: userId, payload: buildCloudPayload(state) }, { onConflict: 'user_id' })
+      .select('updated_at')
+      .single();
     if (error) throw error;
+    return { ok: true, updated_at: data ? data.updated_at : null };
+  } catch (e) {
+    console.warn('[Supabase] Falha ao salvar na nuvem; dados preservados localmente.', e);
+    return { ok: false };
+  }
+}
+
+// Debounce do save na nuvem (1,5 s) com callback de resultado
+function debouncedSaveToCloud(userId, state, onDone) {
+  if (debouncedSaveToCloud._timer) clearTimeout(debouncedSaveToCloud._timer);
+  debouncedSaveToCloud._timer = setTimeout(function() {
+    debouncedSaveToCloud._timer = null;
+    saveStateToCloud(userId, state).then(function(res) { if (onDone) onDone(res); });
+  }, 1500);
+}
+debouncedSaveToCloud._timer = null;
+function cancelPendingCloudSave() {
+  if (debouncedSaveToCloud._timer) clearTimeout(debouncedSaveToCloud._timer);
+  debouncedSaveToCloud._timer = null;
+}
+
+/* ----- Backups por aparelho (retidos por 3 dias no servidor) ----- */
+async function saveBackupToCloud(userId, state, reason) {
+  const sb = getSupabase();
+  if (!sb || !userId || !hasMeaningfulData(state)) return false;
+  const dev = getDeviceInfo();
+  try {
+    const { error } = await sb.from('state_backups').insert({
+      user_id: userId,
+      device_id: dev.id,
+      device_label: dev.label,
+      reason: reason || 'automatico',
+      payload: state,
+    });
+    if (error) throw error;
+    try { localStorage.setItem('tcu_last_backup_at_' + userId, String(Date.now())); } catch (e) {}
     return true;
   } catch (e) {
-    console.warn('[Supabase] Falha ao salvar na nuvem, dados preservados localmente.', e);
+    console.warn('[Supabase] Falha ao gravar backup.', e);
     return false;
   }
 }
 
-// Debounce especializado para o save na nuvem com callback de status
-function debouncedSaveToCloud(userId, state, setStatus) {
-  if (debouncedSaveToCloud._timer) clearTimeout(debouncedSaveToCloud._timer);
-  debouncedSaveToCloud._timer = setTimeout(function() {
-    saveStateToCloud(userId, state)
-      .then(function(ok) { if (setStatus) setStatus(ok ? 'saved' : 'error'); })
-      .catch(function()  { if (setStatus) setStatus('error'); });
-  }, 1500);
+// Grava backup no máximo 1x por intervalo (padrão: 60 min) por aparelho
+function maybeBackupToCloud(userId, state, reason, minIntervalMin) {
+  let last = 0;
+  try { last = Number(localStorage.getItem('tcu_last_backup_at_' + userId)) || 0; } catch (e) {}
+  const interval = (minIntervalMin || 60) * 60 * 1000;
+  if (Date.now() - last < interval) return Promise.resolve(false);
+  return saveBackupToCloud(userId, state, reason);
 }
-debouncedSaveToCloud._timer = null;
+
+async function listCloudBackups(userId) {
+  const sb = getSupabase();
+  if (!sb || !userId) return [];
+  const { data, error } = await sb
+    .from('state_backups')
+    .select('id, created_at, device_id, device_label, reason')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchCloudBackupPayload(backupId) {
+  const sb = getSupabase();
+  if (!sb) return null;
+  const { data, error } = await sb.from('state_backups').select('payload').eq('id', backupId).single();
+  if (error) throw error;
+  return data ? data.payload : null;
+}
+
+async function sendWeeklyReportTest() {
+  const sb = getSupabase();
+  if (!sb) throw new Error('Supabase não configurado.');
+  const { data, error } = await sb.functions.invoke('weekly-report', { body: { test: true } });
+  if (error) throw error;
+  return data;
+}
+
+/* ============================= MOTOR DO CICLO (derivado das atividades) ============================= */
+// O progresso de cada etapa é SEMPRE recalculado a partir das atividades vinculadas
+// (stepId + cycleRound). Assim, excluir/editar uma atividade reflete no ciclo imediatamente.
+function computeCycleProgress(cycle, activities, round) {
+  const r = Number(round) || 0;
+  const sums = {};
+  (activities || []).forEach(a => {
+    if (a && a.stepId && a.cycleRound === r) sums[a.stepId] = (sums[a.stepId] || 0) + (Number(a.seconds) || 0);
+  });
+  return (cycle || []).map(s => Object.assign({}, s, { studiedSeconds: sums[s.id] || 0 }));
+}
+
+// Decide a qual etapa (da rodada atual) a atividade será creditada — ou null se não vincular
+function resolveStepForActivity(cycleView, activity, allDisciplines) {
+  if (!activity || activity.noCycle) return null;
+  const disc = (allDisciplines || []).find(d => d.id === activity.disciplineId);
+  if (!disc || !disc.topics || disc.topics.length === 0) return null;
+  const list = cycleView || [];
+  if (activity.stepId) {
+    const chosen = list.find(s => s.id === activity.stepId && s.disciplineId === activity.disciplineId);
+    if (chosen) return chosen.id;
+  }
+  const pending = list.find(s => s.disciplineId === activity.disciplineId && (s.studiedSeconds || 0) < (s.targetMinutes * 60));
+  if (pending) return pending.id;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].disciplineId === activity.disciplineId) return list[i].id;
+  }
+  return null;
+}
+
+// Migração do modelo antigo (contador) para o modelo derivado. Preserva o progresso exibido,
+// atribuindo à rodada atual as atividades mais recentes de cada etapa (até o tempo já registrado).
+function migrateCycleModel(cycle, activities, round) {
+  const r = Number(round) || 0;
+  const acts = (activities || []).map(a => Object.assign({}, a));
+  const stepIds = {};
+  (cycle || []).forEach(step => {
+    stepIds[step.id] = true;
+    const budget = (Number(step.studiedSeconds) || 0) + 60;
+    let cum = 0;
+    acts.filter(a => a.stepId === step.id)
+      .sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0))
+      .forEach(a => {
+        const sec = Number(a.seconds) || 0;
+        if (cum + sec <= budget) { a.cycleRound = r; cum += sec; }
+        else { a.cycleRound = r - 1; }
+      });
+  });
+  acts.forEach(a => { if (a.stepId && !stepIds[a.stepId] && a.cycleRound === undefined) a.cycleRound = r - 1; });
+  return acts;
+}
+
+/* ============================= IMPORTAÇÃO DE CSV ============================= */
+function parseCSVText(text) {
+  const src = String(text || '').replace(/^\uFEFF/, '');
+  const firstLine = src.split(/\r?\n/)[0] || '';
+  const delim = (firstLine.split(';').length >= firstLine.split(',').length) ? ';' : ',';
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
+      } else { field += ch; }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delim) {
+      row.push(field); field = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && src[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some(c => c.trim() !== '')) rows.push(row);
+      row = [];
+    } else {
+      field += ch;
+    }
+  }
+  row.push(field);
+  if (row.some(c => c.trim() !== '')) rows.push(row);
+  return rows;
+}
+
+function parseDateFlexible(s) {
+  const v = String(s || '').trim();
+  let m = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0');
+  return null;
+}
+
+function parseDurationSeconds(minutesStr, formattedStr) {
+  const mv = String(minutesStr || '').trim();
+  if (mv) {
+    const num = Number(mv.indexOf(',') !== -1 ? mv.replace(/\./g, '').replace(',', '.') : mv);
+    if (!isNaN(num) && num > 0) return Math.round(num * 60);
+  }
+  const f = String(formattedStr || '').trim().toLowerCase();
+  if (!f) return 0;
+  const hms = f.match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/);
+  if (hms) return Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3] || 0);
+  const h = f.match(/(\d+)\s*h/), mi = f.match(/(\d+)\s*m/), se = f.match(/(\d+)\s*s/);
+  return (h ? Number(h[1]) * 3600 : 0) + (mi ? Number(mi[1]) * 60 : 0) + (se ? Number(se[1]) : 0);
+}
+
+function activityKey(a) {
+  return [a.date, a.disciplineId, Math.round((Number(a.seconds) || 0) / 60), normalize(a.tipo || ''), Number(a.feitas) || 0, Number(a.acertos) || 0].join('|');
+}
+
+const CSV_PALETTE = ['#0f766e', '#7c3aed', '#b45309', '#0284c7', '#be123c', '#4d7c0f', '#a21caf', '#c2410c'];
+
+// Aceita o mesmo formato gerado por "Exportar Excel (.csv)" — separador ; ou , — e cria matérias desconhecidas
+function parseActivitiesCSV(text, allDisciplines, customMetas, existingActivities) {
+  const rows = parseCSVText(text);
+  if (rows.length < 2) throw new Error('Arquivo vazio ou sem linhas de dados.');
+  const header = rows[0].map(h => normalize(h).trim());
+  const find = (test) => header.findIndex(test);
+  const col = {
+    date: find(h => h.startsWith('data')),
+    time: find(h => h.startsWith('hora')),
+    sigla: find(h => h === 'sigla'),
+    disc: find(h => h.includes('disciplina') || h.includes('materia')),
+    tipo: find(h => h.startsWith('tipo')),
+    mins: find(h => h.includes('minutos')),
+    fmt: find(h => h.includes('formatada') || h === 'duracao' || h === 'tempo'),
+    feitas: find(h => h.includes('feitas') || h === 'questoes'),
+    acertos: find(h => h.startsWith('acertos')),
+  };
+  if (col.date === -1 || (col.disc === -1 && col.sigla === -1) || (col.mins === -1 && col.fmt === -1)) {
+    throw new Error('Cabeçalho não reconhecido. Colunas obrigatórias: Data, Disciplina (ou Sigla) e Duração (minutos ou formatada).');
+  }
+
+  const bySigla = {}, byName = {};
+  (allDisciplines || []).forEach(d => {
+    byName[normalize(d.name).trim()] = d.id;
+    bySigla[normalize(getDisciplineMeta(d.id, customMetas).sigla).trim()] = d.id;
+  });
+
+  const existingKeys = new Set((existingActivities || []).map(activityKey));
+  const newDiscs = {};
+  const out = [];
+  const errors = [];
+  let duplicates = 0;
+  const stamp = Date.now();
+
+  rows.slice(1).forEach((r, i) => {
+    const line = i + 2;
+    const get = (k) => (col[k] >= 0 ? String(r[col[k]] || '').trim() : '');
+    const date = parseDateFlexible(get('date'));
+    if (!date) { errors.push('Linha ' + line + ': data inválida ("' + get('date') + '")'); return; }
+    const seconds = parseDurationSeconds(get('mins'), get('fmt'));
+    if (!seconds) { errors.push('Linha ' + line + ': duração inválida'); return; }
+
+    const name = get('disc');
+    const sigla = get('sigla');
+    let discId = (name && byName[normalize(name).trim()]) || (sigla && bySigla[normalize(sigla).trim()]) || null;
+    if (!discId) {
+      const key = normalize(name || sigla).trim();
+      if (!key) { errors.push('Linha ' + line + ': disciplina ausente'); return; }
+      if (!newDiscs[key]) {
+        const idx = Object.keys(newDiscs).length;
+        const autoSigla = (sigla || (name || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 4)).toUpperCase() || 'MAT';
+        newDiscs[key] = { id: 'cust_' + stamp + '_' + idx, name: name || sigla, sigla: autoSigla, color: CSV_PALETTE[idx % CSV_PALETTE.length] };
+      }
+      discId = newDiscs[key].id;
+    }
+
+    const tipoRaw = get('tipo');
+    const tipo = STUDY_TYPES.find(t => normalize(t) === normalize(tipoRaw)) || tipoRaw || 'Leitura';
+    const feitas = Math.max(0, parseInt(get('feitas'), 10) || 0);
+    const acertos = feitas ? Math.min(feitas, Math.max(0, parseInt(get('acertos'), 10) || 0)) : 0;
+    const tm = get('time').match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    const timeStr = tm ? (tm[1].padStart(2, '0') + ':' + tm[2] + ':' + (tm[3] || '00')) : '12:00:00';
+    const createdAt = (new Date(date + 'T' + timeStr).getTime() || Date.now()) + i;
+
+    const act = {
+      id: 'act_imp_' + stamp.toString(36) + '_' + i + '_' + Math.random().toString(36).slice(2, 6),
+      date: date, disciplineId: discId, tipo: tipo, seconds: seconds,
+      feitas: feitas, acertos: acertos, createdAt: createdAt,
+      stepId: null, cycleRound: null, noCycle: true, imported: true,
+    };
+    const k = activityKey(act);
+    if (existingKeys.has(k)) { duplicates++; return; }
+    existingKeys.add(k);
+    out.push(act);
+  });
+
+  return { activities: out, newDisciplines: Object.values(newDiscs), errors: errors, duplicates: duplicates, total: rows.length - 1 };
+}
+
+function downloadCSVTemplate() {
+  const lines = [
+    'Data da Sessao;Hora do Registro;Sigla;Disciplina;Tipo de Estudo;Duracao (Minutos);Duracao Formatada;Questoes Feitas;Acertos',
+    '05/10/2026;19:30:00;DCO;"Direito Constitucional";"Exercício";90;"1h 30min";40;32',
+    '06/10/2026;;;"Língua Portuguesa";"Leitura";45;;0;0',
+  ];
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'modelo_importacao_estudos.csv';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
 
 
 
@@ -385,12 +697,19 @@ function buildDefaultState() {
   return {
     topics: topics,
     disciplinas: disciplinas,
-    settings: { startDate: '', examDate: '', marginPercent: 20 },
+    settings: {
+      startDate: '',
+      examDate: '',
+      marginPercent: 20,
+      targetExam: 'Tribunal de Contas da União',
+      targetRole: 'Controle de Estudos',
+    },
     history: {},
     activities: [],
     cycle: buildDefaultCycle(),
     cycleRoundsCompleted: 0,
     customDisciplines: [],
+    deletedDisciplineIds: [],
     customMetas: {},
   };
 }
@@ -426,6 +745,7 @@ function loadState() {
       cycle: loadedCycle,
       cycleRoundsCompleted: Number(saved.cycleRoundsCompleted) || 0,
       customDisciplines: Array.isArray(saved.customDisciplines) ? saved.customDisciplines : [],
+      deletedDisciplineIds: Array.isArray(saved.deletedDisciplineIds) ? saved.deletedDisciplineIds : [],
       customMetas: Object.assign({}, saved.customMetas || {}),
     };
   } catch (e) {
@@ -468,6 +788,7 @@ function compactState(state) {
     c: state.cycle,
     cr: state.cycleRoundsCompleted,
     cd: state.customDisciplines,
+    dd: state.deletedDisciplineIds,
     cm: state.customMetas,
     t: compactTopics,
     d: compactDisc,
@@ -508,6 +829,7 @@ function expandState(c) {
     cycle: c.c || def.cycle,
     cycleRoundsCompleted: c.cr || 0,
     customDisciplines: c.cd || [],
+    deletedDisciplineIds: c.dd || [],
     customMetas: c.cm || {},
   };
 }
@@ -1314,75 +1636,117 @@ function AddDisciplineModal({ onSave, onClose }) {
 }
 
 /* ============================= MODAL: EDITAR CORES DAS MATÉRIAS ============================= */
-function EditColorsModal({ allDisciplines, customMetas, onUpdateColor, onDeleteCustomDiscipline, onClose }) {
+function EditColorsModal({ allDisciplines, deletedDisciplines, customMetas, onUpdateColor, onDeleteDiscipline, onRestoreDiscipline, onClose }) {
   const [search, setSearch] = useState('');
+  const [showDeleted, setShowDeleted] = useState(false);
 
   const filtered = useMemo(() => {
     const q = normalize(search);
     return allDisciplines.filter(d => !q || normalize(d.name).includes(q) || normalize(getDisciplineMeta(d.id, customMetas).sigla).includes(q));
   }, [allDisciplines, customMetas, search]);
 
+  const deletedList = deletedDisciplines || [];
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink-950/60 backdrop-blur-sm no-print" onClick={onClose}>
       <div className="bg-paper-100 w-full max-w-xl rounded-lg shadow-2xl border border-brass-200 max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-ink-100">
           <div>
-            <h2 className="font-serif text-xl text-ink-900">Personalizar Cores das Matérias</h2>
-            <p className="text-xs text-ink-400 mt-0.5">Altere a cor de qualquer disciplina no edital, ciclo de estudos e gráficos.</p>
+            <h2 className="font-serif text-xl text-ink-900">Gerenciar Matérias & Cores</h2>
+            <p className="text-xs text-ink-400 mt-0.5">Personalize cores ou remova matérias que não fazem parte do seu concurso.</p>
           </div>
           <button onClick={onClose} className="text-ink-400 hover:text-ink-900 text-2xl leading-none px-1">&times;</button>
         </div>
 
-        <div className="px-6 pt-3 pb-2 border-b border-ink-100">
+        <div className="px-6 pt-3 pb-2 border-b border-ink-100 flex items-center gap-2">
           <input
             type="text"
             value={search}
             onChange={e => setSearch(e.target.value)}
             placeholder="Filtrar por matéria ou sigla..."
-            className="w-full px-3 py-1.5 rounded-md border border-ink-200 text-xs bg-white"
+            className="flex-1 px-3 py-1.5 rounded-md border border-ink-200 text-xs bg-white"
           />
+          {deletedList.length > 0 && (
+            <button
+              onClick={() => setShowDeleted(!showDeleted)}
+              className={"px-2.5 py-1.5 rounded-md text-xs font-semibold border transition-colors flex items-center gap-1 " + (
+                showDeleted ? "bg-ink-800 text-paper-100 border-ink-800" : "bg-white text-ink-700 border-ink-200 hover:bg-ink-50"
+              )}
+            >
+              <span>🗑️</span> Excluídas ({deletedList.length})
+            </button>
+          )}
         </div>
 
         <div className="px-6 py-3 overflow-y-auto flex-1 space-y-2">
-          {filtered.map(d => {
-            const meta = getDisciplineMeta(d.id, customMetas);
-            const isCustom = d.id.startsWith('cust_');
-            return (
-              <div key={d.id} className="flex items-center justify-between gap-3 p-2.5 rounded border border-ink-100 bg-white hover:bg-paper-50 transition-colors">
-                <div className="flex items-center gap-3 min-w-0 flex-1">
-                  <input
-                    type="color"
-                    value={meta.color}
-                    onChange={e => onUpdateColor(d.id, e.target.value)}
-                    className="w-8 h-8 rounded cursor-pointer border border-ink-200 p-0.5 flex-shrink-0"
-                    title="Clique para escolher uma nova cor"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-xs font-bold text-ink-900">[{meta.sigla}]</span>
-                      <span className="text-xs text-ink-800 font-medium truncate">{d.name}</span>
+          {showDeleted ? (
+            <div className="space-y-2">
+              <div className="p-2.5 bg-amber-50 rounded-lg border border-amber-200 text-xs text-amber-900 mb-3">
+                <strong>Matérias excluídas do edital:</strong> Seus dados e registros históricos continuam preservados. Clique em "Restaurar" para trazê-las de volta ao edital.
+              </div>
+              {deletedList.map(d => {
+                const meta = getDisciplineMeta(d.id, customMetas);
+                return (
+                  <div key={d.id} className="flex items-center justify-between gap-3 p-2.5 rounded border border-ink-100 bg-white opacity-80">
+                    <div className="flex items-center gap-3">
+                      <span className="w-4 h-4 rounded-full flex-shrink-0" style={{ backgroundColor: meta.color }}></span>
+                      <div>
+                        <span className="font-mono text-xs font-bold text-ink-900">[{meta.sigla}]</span>
+                        <span className="text-xs text-ink-800 font-medium ml-1.5">{d.name}</span>
+                      </div>
                     </div>
-                    <span className="text-[10px] text-ink-400 font-mono uppercase">{meta.color}</span>
+                    <button
+                      onClick={() => onRestoreDiscipline(d.id)}
+                      className="px-2.5 py-1 bg-okgreen hover:brightness-105 text-white text-xs font-bold rounded shadow-2xs"
+                    >
+                      Restaurar
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            filtered.map(d => {
+              const meta = getDisciplineMeta(d.id, customMetas);
+              const isGeneric = d.id === 'revisao';
+              return (
+                <div key={d.id} className="flex items-center justify-between gap-3 p-2.5 rounded border border-ink-100 bg-white hover:bg-paper-50 transition-colors">
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
+                    <input
+                      type="color"
+                      value={meta.color}
+                      onChange={e => onUpdateColor(d.id, e.target.value)}
+                      className="w-8 h-8 rounded cursor-pointer border border-ink-200 p-0.5 flex-shrink-0"
+                      title="Clique para escolher uma nova cor"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-xs font-bold text-ink-900">[{meta.sigla}]</span>
+                        <span className="text-xs text-ink-800 font-medium truncate">{d.name}</span>
+                      </div>
+                      <span className="text-[10px] text-ink-400 font-mono uppercase">{meta.color}</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    {!isGeneric && (
+                      <button
+                        onClick={() => {
+                          if (confirm(`Excluir a matéria "${d.name}" do edital e ciclo?\n\nO histórico de atividades já realizadas continuará preservado nos seus relatórios.`)) {
+                            onDeleteDiscipline(d.id);
+                          }
+                        }}
+                        className="text-okred text-xs hover:underline px-1.5 py-0.5 rounded hover:bg-okred/10"
+                        title="Excluir matéria (mantém histórico salvo)"
+                      >
+                        excluir
+                      </button>
+                    )}
                   </div>
                 </div>
-
-                <div className="flex items-center gap-2 flex-shrink-0">
-                  {isCustom && (
-                    <button
-                      onClick={() => {
-                        if (confirm(`Excluir a matéria customizada "${d.name}"?`)) {
-                          onDeleteCustomDiscipline(d.id);
-                        }
-                      }}
-                      className="text-okred text-xs hover:underline px-1"
-                    >
-                      remover
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-3 border-t border-ink-100 bg-paper-100">
@@ -2535,6 +2899,599 @@ function ActivityLog({ activities, allDisciplines, customMetas, onEdit, onDelete
   );
 }
 
+/* ============================= MODAL: ALTERAR CONCURSO / CARGO ============================= */
+function EditContestModal({ currentExam, currentRole, onSave, onClose }) {
+  const [exam, setExam] = useState(currentExam || 'Tribunal de Contas da União');
+  const [role, setRole] = useState(currentRole || 'Controle de Estudos');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSave({
+      targetExam: exam.trim() || 'Controle de Estudos',
+      targetRole: role.trim() || 'Edital & Ciclo de Estudos',
+    });
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink-950/60 backdrop-blur-sm no-print" onClick={onClose}>
+      <div className="bg-paper-100 w-full max-w-md rounded-xl shadow-2xl border border-brass-200 p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4 border-b border-ink-100 pb-3">
+          <div>
+            <h3 className="font-serif text-lg font-bold text-ink-900">Personalizar Concurso & Foco</h3>
+            <p className="text-xs text-ink-400 mt-0.5">Adapte o cabeçalho para qualquer edital ou prova.</p>
+          </div>
+          <button onClick={onClose} className="text-ink-400 hover:text-ink-700 text-xl leading-none">&times;</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs font-semibold text-ink-700 mb-1">
+              Órgão / Concurso <span className="text-ink-400 font-normal">(substitui "Tribunal de Contas da União")</span>
+            </label>
+            <input
+              type="text"
+              value={exam}
+              onChange={e => setExam(e.target.value)}
+              placeholder="Ex: Polícia Federal, Receita Federal, TJ-SP, OAB..."
+              required
+              className="w-full px-3 py-2 text-sm border border-ink-200 rounded-md focus:outline-none focus:border-brass-400 bg-white"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-ink-700 mb-1">
+              Título do Painel / Cargo <span className="text-ink-400 font-normal">(substitui o título principal)</span>
+            </label>
+            <input
+              type="text"
+              value={role}
+              onChange={e => setRole(e.target.value)}
+              placeholder="Ex: Controle de Estudos, Agente, Auditor Fiscal..."
+              required
+              className="w-full px-3 py-2 text-sm border border-ink-200 rounded-md focus:outline-none focus:border-brass-400 bg-white"
+            />
+          </div>
+
+          <div className="rounded-lg bg-brass-50 border border-brass-200/60 p-3 text-xs text-ink-700 leading-relaxed">
+            💡 <strong>Dica:</strong> Você também pode excluir matérias que não caem na sua prova pelo botão <em>"Cores das Matérias"</em> e adicionar as matérias específicas pelo botão <em>"+ Nova Matéria"</em>.
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2 border-t border-ink-100">
+            <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 rounded-md">
+              Cancelar
+            </button>
+            <button type="submit" className="px-5 py-2 text-sm font-semibold bg-brass-500 hover:bg-brass-600 text-ink-950 rounded-md shadow-sm transition-colors">
+              Salvar Alterações
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/* ============================= MODAL: IMPORTAÇÃO CSV ============================= */
+function ImportCSVModal({ allDisciplines, customMetas, existingActivities, onConfirmImport, onClose }) {
+  const [fileText, setFileText] = useState(null);
+  const [fileName, setFileName] = useState('');
+  const [parsed, setParsed] = useState(null);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleFileChange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    setErrorMsg('');
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target.result;
+      setFileText(text);
+      try {
+        const res = parseActivitiesCSV(text, allDisciplines, customMetas, existingActivities);
+        setParsed(res);
+      } catch (err) {
+        setErrorMsg(err.message || 'Erro ao processar o arquivo CSV.');
+        setParsed(null);
+      }
+    };
+    reader.onerror = () => {
+      setErrorMsg('Falha ao ler o arquivo selecionado.');
+    };
+    reader.readAsText(file, 'utf-8');
+  };
+
+  const handleConfirm = () => {
+    if (!parsed || !parsed.activities || parsed.activities.length === 0) {
+      alert('Nenhuma atividade válida encontrada para importar.');
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      onConfirmImport(parsed);
+      onClose();
+    } catch (err) {
+      setErrorMsg('Erro ao salvar atividades importadas: ' + err.message);
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink-950/60 backdrop-blur-sm no-print" onClick={onClose}>
+      <div className="bg-paper-100 w-full max-w-2xl rounded-xl shadow-2xl border border-brass-200 p-6 max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between pb-3 border-b border-ink-100">
+          <div>
+            <h3 className="font-serif text-xl font-bold text-ink-900">Importar Registros de Estudo via .CSV</h3>
+            <p className="text-xs text-ink-400 mt-0.5">Importe sessões de estudo salvas em planilhas ou de outros ciclos.</p>
+          </div>
+          <button onClick={onClose} className="text-ink-400 hover:text-ink-700 text-2xl leading-none">&times;</button>
+        </div>
+
+        <div className="py-4 overflow-y-auto flex-1 space-y-4">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-3 bg-brass-50/70 border border-brass-200/70 rounded-lg text-xs text-ink-700">
+            <div>
+              <strong>Formato esperado:</strong> Arquivo <code>.csv</code> separado por ponto e vírgula (<code>;</code>) ou vírgula (<code>,</code>).
+              <div className="text-ink-500 mt-0.5">Colunas: Data, Disciplina, Tipo, Duração (Minutos) e Questões Feitas / Acertos.</div>
+            </div>
+            <button
+              type="button"
+              onClick={downloadCSVTemplate}
+              className="px-3 py-1.5 rounded bg-white hover:bg-brass-100 border border-brass-300 font-semibold text-brass-700 whitespace-nowrap text-xs shadow-2xs self-start sm:self-center"
+            >
+              📥 Baixar Modelo .CSV
+            </button>
+          </div>
+
+          <div className="border-2 border-dashed border-ink-200 hover:border-brass-400 rounded-xl p-6 text-center bg-white transition-colors">
+            <input
+              type="file"
+              id="csvFileInput"
+              accept=".csv,text/csv,text/plain"
+              onChange={handleFileChange}
+              className="hidden"
+            />
+            <label htmlFor="csvFileInput" className="cursor-pointer flex flex-col items-center">
+              <span className="text-3xl mb-2">📄</span>
+              <span className="text-sm font-semibold text-ink-800">
+                {fileName ? fileName : 'Clique aqui para selecionar seu arquivo .csv'}
+              </span>
+              <span className="text-xs text-ink-400 mt-1">ou arraste e solte o arquivo nesta área</span>
+            </label>
+          </div>
+
+          {errorMsg && (
+            <div className="p-3 rounded-lg bg-okred/10 border border-okred/30 text-okred text-xs">
+              <strong>Erro:</strong> {errorMsg}
+            </div>
+          )}
+
+          {parsed && (
+            <div className="space-y-3 bg-white p-4 rounded-xl border border-ink-100">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-ink-500">Resumo da Leitura</h4>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <div className="p-2.5 rounded-lg bg-okgreen/10 border border-okgreen/20 text-center">
+                  <div className="font-mono text-lg font-bold text-okgreen">{parsed.activities.length}</div>
+                  <div className="text-[10px] text-ink-600 font-medium">Novas Atividades</div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-brass-50 border border-brass-200 text-center">
+                  <div className="font-mono text-lg font-bold text-brass-700">{parsed.newDisciplines.length}</div>
+                  <div className="text-[10px] text-ink-600 font-medium">Matérias a Criar</div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-ink-50 border border-ink-100 text-center">
+                  <div className="font-mono text-lg font-bold text-ink-600">{parsed.duplicates}</div>
+                  <div className="text-[10px] text-ink-400 font-medium">Duplicadas (Ignoradas)</div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-paper-200 border border-ink-100 text-center">
+                  <div className="font-mono text-lg font-bold text-ink-800">{parsed.total}</div>
+                  <div className="text-[10px] text-ink-500 font-medium">Linhas Lidas</div>
+                </div>
+              </div>
+
+              {parsed.newDisciplines.length > 0 && (
+                <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 text-xs text-amber-900">
+                  <strong>Novas matérias identificadas:</strong>
+                  <ul className="list-disc list-inside mt-1 space-y-0.5">
+                    {parsed.newDisciplines.map(d => (
+                      <li key={d.id}><strong>{d.sigla}</strong> — {d.name}</li>
+                    ))}
+                  </ul>
+                  <span className="block mt-1 text-[11px] text-amber-700">Elas serão adicionadas automaticamente à sua lista de matérias com cores próprias.</span>
+                </div>
+              )}
+
+              {parsed.errors && parsed.errors.length > 0 && (
+                <div className="p-3 bg-ink-50 rounded-lg border border-ink-200 text-xs text-ink-700 max-h-28 overflow-y-auto font-mono">
+                  <strong className="text-ink-900 block font-sans mb-1">Avisos ({parsed.errors.length}):</strong>
+                  {parsed.errors.map((err, i) => <div key={i} className="text-[11px] text-ink-500">{err}</div>)}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-3 border-t border-ink-100">
+          <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 rounded-md">
+            Cancelar
+          </button>
+          <button
+            type="button"
+            disabled={!parsed || parsed.activities.length === 0 || isProcessing}
+            onClick={handleConfirm}
+            className="px-5 py-2 text-sm font-semibold bg-brass-500 hover:bg-brass-600 text-ink-950 rounded-md shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isProcessing ? 'Importando...' : `Confirmar Importação (${parsed ? parsed.activities.length : 0})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================= CÁLCULO DO RELATÓRIO SEMANAL ============================= */
+// Semana definida estritamente de Domingo a Sábado
+function getSundaySaturdayRange(referenceDateStr) {
+  const d = referenceDateStr ? new Date(referenceDateStr + 'T00:00:00') : new Date();
+  const dayOfWeek = d.getDay(); // 0 = Domingo, 6 = Sábado
+  // Domingo da semana atual
+  const sunday = new Date(d);
+  sunday.setDate(d.getDate() - dayOfWeek);
+  // Sábado da semana atual
+  const saturday = new Date(sunday);
+  saturday.setDate(sunday.getDate() + 6);
+
+  // Domingo da semana anterior
+  const prevSunday = new Date(sunday);
+  prevSunday.setDate(sunday.getDate() - 7);
+  // Sábado da semana anterior
+  const prevSaturday = new Date(sunday);
+  prevSaturday.setDate(sunday.getDate() - 1);
+
+  const toStr = (date) => date.toLocaleDateString('sv-SE');
+  return {
+    curStart: toStr(sunday),
+    curEnd: toStr(saturday),
+    prevStart: toStr(prevSunday),
+    prevEnd: toStr(prevSaturday),
+  };
+}
+
+function computeWeeklyReportData(activities, allDisciplines, customMetas, referenceDateStr) {
+  const { curStart, curEnd, prevStart, prevEnd } = getSundaySaturdayRange(referenceDateStr);
+  const acts = Array.isArray(activities) ? activities : [];
+
+  const curActs = acts.filter(a => a.date && a.date >= curStart && a.date <= curEnd);
+  const prevActs = acts.filter(a => a.date && a.date >= prevStart && a.date <= prevEnd);
+
+  const sumSec = list => list.reduce((a, s) => a + (Number(s.seconds) || 0), 0);
+  const sumFeitas = list => list.reduce((a, s) => a + (Number(s.feitas) || 0), 0);
+  const sumAcertos = list => list.reduce((a, s) => a + (Number(s.acertos) || 0), 0);
+
+  const curSec = sumSec(curActs);
+  const prevSec = sumSec(prevActs);
+  const hoursVar = prevSec > 0 ? ((curSec - prevSec) / prevSec) * 100 : (curSec > 0 ? 100 : 0);
+
+  const curFeitas = sumFeitas(curActs);
+  const prevFeitas = sumFeitas(prevActs);
+  const curAcertos = sumAcertos(curActs);
+  const prevAcertos = sumAcertos(prevActs);
+
+  const curPct = curFeitas > 0 ? (curAcertos / curFeitas) * 100 : 0;
+  const prevPct = prevFeitas > 0 ? (prevAcertos / prevFeitas) * 100 : 0;
+
+  const questVar = prevFeitas > 0 ? ((curFeitas - prevFeitas) / prevFeitas) * 100 : (curFeitas > 0 ? 100 : 0);
+  const pctVar = curPct - prevPct; // em pontos percentuais
+
+  // Rastreamento por dia da semana (Domingo a Sábado)
+  const daysOfWeek = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
+  const dailyTrack = [];
+  for (let i = 0; i < 7; i++) {
+    const curDay = addDays(curStart, i);
+    const dayActs = curActs.filter(a => a.date === curDay);
+    dailyTrack.push({
+      date: curDay,
+      dayName: daysOfWeek[i],
+      seconds: sumSec(dayActs),
+      feitas: sumFeitas(dayActs),
+      acertos: sumAcertos(dayActs),
+    });
+  }
+
+  // Tipos de estudo no período atual
+  const byTipo = {};
+  curActs.forEach(a => {
+    const t = a.tipo || 'Outro';
+    byTipo[t] = (byTipo[t] || 0) + (Number(a.seconds) || 0);
+  });
+  const tiposSummary = Object.entries(byTipo)
+    .map(([tipo, sec]) => ({
+      tipo,
+      seconds: sec,
+      pct: curSec > 0 ? (sec / curSec) * 100 : 0,
+    }))
+    .sort((a, b) => b.seconds - a.seconds);
+
+  // Desempenho por Matéria com comparação
+  const discIds = new Set([...curActs.map(a => a.disciplineId), ...prevActs.map(a => a.disciplineId)]);
+  const materias = Array.from(discIds).map(id => {
+    const disc = allDisciplines.find(d => d.id === id);
+    const meta = getDisciplineMeta(id, customMetas);
+
+    const cActs = curActs.filter(a => a.disciplineId === id);
+    const pActs = prevActs.filter(a => a.disciplineId === id);
+
+    const cFeitas = sumFeitas(cActs);
+    const cAcertos = sumAcertos(cActs);
+    const cPct = cFeitas > 0 ? (cAcertos / cFeitas) * 100 : 0;
+
+    const pFeitas = sumFeitas(pActs);
+    const pAcertos = sumAcertos(pActs);
+    const pPct = pFeitas > 0 ? (pAcertos / pFeitas) * 100 : 0;
+
+    const mQuestVar = pFeitas > 0 ? ((cFeitas - pFeitas) / pFeitas) * 100 : (cFeitas > 0 ? 100 : 0);
+    const mPctVar = cPct - pPct;
+
+    return {
+      id,
+      name: disc ? disc.name : id,
+      sigla: meta.sigla,
+      color: meta.color,
+      curSeconds: sumSec(cActs),
+      curFeitas: cFeitas,
+      curAcertos: cAcertos,
+      curPct: cPct,
+      prevFeitas: pFeitas,
+      prevPct: pPct,
+      questVar: mQuestVar,
+      pctVar: mPctVar,
+    };
+  }).filter(m => m.curSeconds > 0 || m.curFeitas > 0 || m.prevFeitas > 0)
+    .sort((a, b) => b.curSeconds - a.curSeconds);
+
+  return {
+    curStart,
+    curEnd,
+    prevStart,
+    prevEnd,
+    curSec,
+    prevSec,
+    hoursVar,
+    curFeitas,
+    prevFeitas,
+    curAcertos,
+    curPct,
+    prevPct,
+    questVar,
+    pctVar,
+    dailyTrack,
+    tiposSummary,
+    materias,
+  };
+}
+
+/* ============================= MODAL: RESUMO SEMANAL & TESTE DE E-MAIL ============================= */
+function WeeklyReportModal({ activities, allDisciplines, customMetas, contestName, userEmail, onClose }) {
+  const [reportDate, setReportDate] = useState(() => todayStr());
+  const [sendingTest, setSendingTest] = useState(false);
+  const [sendResult, setSendResult] = useState(null);
+
+  const report = useMemo(() => {
+    return computeWeeklyReportData(activities, allDisciplines, customMetas, reportDate);
+  }, [activities, allDisciplines, customMetas, reportDate]);
+
+  const handleSendTest = async () => {
+    setSendingTest(true);
+    setSendResult(null);
+    try {
+      const res = await sendWeeklyReportTest();
+      setSendResult({ ok: true, msg: 'E-mail semanal de teste disparado com sucesso para ' + (userEmail || 'sua conta') + '!' });
+    } catch (err) {
+      setSendResult({ ok: false, msg: 'Erro ao disparar e-mail: ' + (err.message || 'Verifique se a Edge Function está implantada no Supabase.') });
+    } finally {
+      setSendingTest(false);
+    }
+  };
+
+  const fmtVar = (val, isPP) => {
+    if (isNaN(val) || val === 0) return <span className="text-ink-400 font-mono">0{isPP ? ' p.p.' : '%'}</span>;
+    const isPos = val > 0;
+    return (
+      <span className={`font-mono font-semibold ${isPos ? 'text-okgreen' : 'text-okred'}`}>
+        {isPos ? '+' : ''}{val.toFixed(1).replace('.', ',')}{isPP ? ' p.p.' : '%'}
+      </span>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink-950/60 backdrop-blur-sm no-print" onClick={onClose}>
+      <div className="bg-paper-100 w-full max-w-4xl rounded-xl shadow-2xl border border-brass-200 p-6 max-h-[92vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between pb-3 border-b border-ink-100">
+          <div>
+            <h3 className="font-serif text-xl font-bold text-ink-900">Resumo Semanal de Estudos</h3>
+            <p className="text-xs text-ink-400 mt-0.5">
+              Enviado automaticamente aos sábados às 23:59 para <strong>{userEmail || 'seu e-mail'}</strong>.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-ink-400 hover:text-ink-700 text-2xl leading-none">&times;</button>
+        </div>
+
+        <div className="py-4 overflow-y-auto flex-1 space-y-5">
+          {/* Cabeçalho do Período */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-ink-900 text-paper-100 rounded-xl">
+            <div>
+              <span className="text-[10px] uppercase tracking-wider text-brass-300 font-bold block">Período de Análise (Domingo a Sábado)</span>
+              <span className="font-serif text-lg font-semibold">
+                {formatBR(report.curStart)} a {formatBR(report.curEnd)}
+              </span>
+              <span className="text-xs text-ink-300 block mt-0.5">
+                Comparado com a semana anterior: {formatBR(report.prevStart)} a {formatBR(report.prevEnd)}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleSendTest}
+                disabled={sendingTest}
+                className="px-4 py-2 rounded-lg bg-brass-500 hover:bg-brass-600 text-ink-950 text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+              >
+                <span>✉️</span>
+                <span>{sendingTest ? 'Disparando...' : 'Disparar E-mail de Teste'}</span>
+              </button>
+            </div>
+          </div>
+
+          {sendResult && (
+            <div className={`p-3 rounded-lg text-xs ${sendResult.ok ? 'bg-okgreen/10 border border-okgreen/30 text-okgreen' : 'bg-okred/10 border border-okred/30 text-okred'}`}>
+              {sendResult.msg}
+            </div>
+          )}
+
+          {/* Cards Superiores com Variação */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="bg-white p-3.5 rounded-xl border border-ink-100 shadow-2xs">
+              <span className="text-[11px] uppercase tracking-wider text-ink-400 font-bold block mb-1">Horas Líquidas</span>
+              <div className="font-serif text-2xl font-bold text-ink-900">{formatDuration(report.curSec)}</div>
+              <div className="text-[11px] text-ink-500 mt-1">
+                vs semana ant.: {fmtVar(report.hoursVar, false)}
+              </div>
+            </div>
+
+            <div className="bg-white p-3.5 rounded-xl border border-ink-100 shadow-2xs">
+              <span className="text-[11px] uppercase tracking-wider text-ink-400 font-bold block mb-1">Questões Resolvidas</span>
+              <div className="font-serif text-2xl font-bold text-ink-900">{report.curFeitas}</div>
+              <div className="text-[11px] text-ink-500 mt-1">
+                vs semana ant.: {fmtVar(report.questVar, false)}
+              </div>
+            </div>
+
+            <div className="bg-white p-3.5 rounded-xl border border-ink-100 shadow-2xs">
+              <span className="text-[11px] uppercase tracking-wider text-ink-400 font-bold block mb-1">Aproveitamento</span>
+              <div className="font-serif text-2xl font-bold text-ink-900">
+                {report.curFeitas > 0 ? report.curPct.toFixed(1).replace('.', ',') + '%' : '—'}
+              </div>
+              <div className="text-[11px] text-ink-500 mt-1">
+                vs semana ant.: {fmtVar(report.pctVar, true)}
+              </div>
+            </div>
+
+            <div className="bg-white p-3.5 rounded-xl border border-ink-100 shadow-2xs">
+              <span className="text-[11px] uppercase tracking-wider text-ink-400 font-bold block mb-1">Acertos Líquidos</span>
+              <div className="font-serif text-2xl font-bold text-okgreen">{report.curAcertos} acertos</div>
+              <div className="text-[11px] text-ink-500 mt-1">
+                {report.curFeitas > 0 ? (report.curFeitas - report.curAcertos) + ' erros' : '0 erros'}
+              </div>
+            </div>
+          </div>
+
+          {/* Quadro de Rastreamento Diário da Semana */}
+          <div className="bg-white p-4 rounded-xl border border-ink-100 shadow-2xs space-y-3">
+            <div className="flex items-center justify-between">
+              <h4 className="font-serif text-sm font-bold text-ink-900">Quadro de Rastreamento da Semana (Dom a Sáb)</h4>
+              <span className="text-xs text-ink-400 font-mono">Total: {formatDuration(report.curSec)}</span>
+            </div>
+            <div className="grid grid-cols-7 gap-2 text-center">
+              {report.dailyTrack.map(d => {
+                const maxSec = Math.max(...report.dailyTrack.map(x => x.seconds), 3600);
+                const barPct = Math.min(100, (d.seconds / maxSec) * 100);
+                return (
+                  <div key={d.date} className="bg-paper-50 p-2.5 rounded-lg border border-ink-100 flex flex-col justify-between">
+                    <span className="text-[10px] uppercase font-bold text-ink-400 block">{d.dayName.slice(0, 3)}</span>
+                    <span className="text-[10px] text-ink-500 font-mono block mb-2">{formatBR(d.date).slice(0, 5)}</span>
+                    <div className="h-14 flex items-end justify-center my-1 bg-ink-50 rounded">
+                      <div
+                        className="w-full bg-brass-500 rounded-b transition-all"
+                        style={{ height: `${barPct}%`, minHeight: d.seconds > 0 ? '4px' : '0px' }}
+                      ></div>
+                    </div>
+                    <span className="text-[11px] font-mono font-bold text-ink-800 mt-1 block">
+                      {d.seconds > 0 ? formatHMSBrief(d.seconds) : '—'}
+                    </span>
+                    <span className="text-[9.5px] text-ink-400 font-mono block">
+                      {d.feitas > 0 ? `${d.acertos}/${d.feitas}q` : ''}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Quadro Resumo dos Tipos de Estudo */}
+          <div className="bg-white p-4 rounded-xl border border-ink-100 shadow-2xs space-y-3">
+            <h4 className="font-serif text-sm font-bold text-ink-900">Distribuição por Tipo de Estudo</h4>
+            <div className="space-y-2">
+              {report.tiposSummary.length === 0 ? (
+                <div className="text-xs text-ink-400 py-3 text-center">Nenhuma sessão registrada nesta semana.</div>
+              ) : (
+                report.tiposSummary.map(t => (
+                  <div key={t.tipo} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium text-ink-800">{t.tipo}</span>
+                      <span className="font-mono text-ink-600">
+                        {formatDuration(t.seconds)} <span className="text-ink-400 font-normal">({t.pct.toFixed(1).replace('.', ',')}%)</span>
+                      </span>
+                    </div>
+                    <div className="w-full bg-ink-50 h-2 rounded-full overflow-hidden">
+                      <div className="bg-brass-500 h-full rounded-full" style={{ width: `${t.pct}%` }}></div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Tabela de Matérias com Comparação */}
+          <div className="bg-white p-4 rounded-xl border border-ink-100 shadow-2xs space-y-3">
+            <h4 className="font-serif text-sm font-bold text-ink-900">Questões e Aproveitamento por Matéria</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-ink-100 text-[10px] uppercase text-ink-400 font-bold">
+                    <th className="py-2">Matéria</th>
+                    <th className="py-2 text-center">Tempo</th>
+                    <th className="py-2 text-center">Questões</th>
+                    <th className="py-2 text-center">Var. Questões</th>
+                    <th className="py-2 text-center">% Acerto</th>
+                    <th className="py-2 text-center">Var. % Acerto</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-ink-50">
+                  {report.materias.length === 0 ? (
+                    <tr>
+                      <td colSpan="6" className="py-4 text-center text-ink-400">Nenhum dado por matéria nesta semana.</td>
+                    </tr>
+                  ) : (
+                    report.materias.map(m => (
+                      <tr key={m.id} className="hover:bg-paper-50 font-mono">
+                        <td className="py-2 font-sans font-medium text-ink-900 flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: m.color }}></span>
+                          <span className="font-bold text-[11px]">[{m.sigla}]</span>
+                          <span>{m.name}</span>
+                        </td>
+                        <td className="py-2 text-center text-ink-600">{formatHMSBrief(m.curSeconds)}</td>
+                        <td className="py-2 text-center font-bold text-ink-800">{m.curFeitas > 0 ? `${m.curAcertos}/${m.curFeitas}` : '—'}</td>
+                        <td className="py-2 text-center">{m.curFeitas > 0 || m.prevFeitas > 0 ? fmtVar(m.questVar, false) : '—'}</td>
+                        <td className="py-2 text-center font-bold text-ink-900">{m.curFeitas > 0 ? `${m.curPct.toFixed(1).replace('.', ',')}%` : '—'}</td>
+                        <td className="py-2 text-center">{m.curFeitas > 0 || m.prevFeitas > 0 ? fmtVar(m.pctVar, true) : '—'}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-end pt-3 border-t border-ink-100">
+          <button type="button" onClick={onClose} className="px-5 py-2 text-sm font-semibold bg-ink-800 hover:bg-ink-700 text-paper-100 rounded-md">
+            Fechar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+
 /* ============================= GRÁFICO DO STORY: EVOLUÇÃO COM DIAS EMPILHADOS ============================= */
 function StoryPeriodStackedBarChart({ days, disciplines, customMetas }) {
   const canvasRef = useRef(null);
@@ -2646,6 +3603,10 @@ function App() {
   const [showCompleteCycleConfirm, setShowCompleteCycleConfirm] = useState(false);
   const [showAddDiscipline, setShowAddDiscipline] = useState(false);
   const [showEditColors, setShowEditColors] = useState(false);
+  const [showEditContestModal, setShowEditContestModal] = useState(false);
+  const [showImportCSV, setShowImportCSV] = useState(false);
+  const [showWeeklyReportModal, setShowWeeklyReportModal] = useState(false);
+  const [storyLoading, setStoryLoading] = useState(false);
   const [blockFilter, setBlockFilter] = useState('todos');
   const [query, setQuery] = useState('');
   const [activeTab, setActiveTab] = useState('edital');
@@ -2658,73 +3619,128 @@ function App() {
   const [filterTableByDate, setFilterTableByDate] = useState(true);
   const [editingActivity, setEditingActivity] = useState(null);
 
-  // ── Auth & Cloud Sync ──────────────────────────────────────────────────
+  // ── Auth, Sincronização Segura e Backups na Nuvem ───────────────────────
   const [currentUser, setCurrentUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(SUPABASE_CONFIGURED);
   const [syncStatus, setSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'saved' | 'error'
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const isSyncingFromCloudRef = useRef(false);
 
-  // Monitora mudanças de sessão e carrega estado da nuvem ao logar
+  // Monitora autenticação e baixa SEMPRE os dados do servidor ao logar em novo aparelho
   useEffect(() => {
     if (!SUPABASE_CONFIGURED) return;
 
-    // Verifica sessão existente ao montar
+    const syncFromCloud = async (user) => {
+      if (!user) return;
+      isSyncingFromCloudRef.current = true;
+      try {
+        const res = await loadStateFromCloud(user.id);
+        if (res && res.ok && res.row && res.row.payload) {
+          const cloudPayload = res.row.payload;
+          setState(prev => {
+            const def = buildDefaultState();
+            return {
+              topics:              Object.assign({}, def.topics, cloudPayload.topics || {}),
+              disciplinas:         Object.assign({}, def.disciplinas, cloudPayload.disciplinas || {}),
+              settings:            Object.assign({}, def.settings, cloudPayload.settings || {}),
+              history:             Object.assign({}, prev.history, cloudPayload.history || {}),
+              activities:          Array.isArray(cloudPayload.activities) ? cloudPayload.activities : [],
+              cycle:               Array.isArray(cloudPayload.cycle) ? cloudPayload.cycle : def.cycle,
+              cycleRoundsCompleted: Number(cloudPayload.cycleRoundsCompleted) || 0,
+              customDisciplines:   Array.isArray(cloudPayload.customDisciplines) ? cloudPayload.customDisciplines : [],
+              deletedDisciplineIds:Array.isArray(cloudPayload.deletedDisciplineIds) ? cloudPayload.deletedDisciplineIds : [],
+              customMetas:         Object.assign({}, prev.customMetas, cloudPayload.customMetas || {}),
+            };
+          });
+          // Registra snapshot de backup deste aparelho conectado (armazenado por >= 3 dias)
+          saveBackupToCloud(user.id, cloudPayload, 'login_sync');
+        } else {
+          // Se for o primeiro acesso da conta na nuvem, salva o estado atual
+          saveStateToCloud(user.id, state);
+          saveBackupToCloud(user.id, state, 'initial_upload');
+        }
+      } catch (err) {
+        console.error('Erro na sincronização inicial da nuvem:', err);
+      } finally {
+        setTimeout(() => {
+          isSyncingFromCloudRef.current = false;
+        }, 600);
+      }
+    };
+
+    // Sessão inicial
     supabaseGetUser().then(user => {
       setCurrentUser(user);
       setAuthLoading(false);
       if (user) {
-        loadStateFromCloud(user.id).then(cloudPayload => {
-          if (cloudPayload) {
-            // Mescla: estado da nuvem tem prioridade (dados mais recentes)
-            setState(prev => {
-              const def = buildDefaultState();
-              return {
-                topics:              Object.assign({}, def.topics, cloudPayload.topics || prev.topics),
-                disciplinas:         Object.assign({}, def.disciplinas, cloudPayload.disciplinas || prev.disciplinas),
-                settings:            Object.assign({}, def.settings, cloudPayload.settings || prev.settings),
-                history:             Object.assign({}, prev.history, cloudPayload.history || {}),
-                activities:          Array.isArray(cloudPayload.activities) ? cloudPayload.activities : prev.activities,
-                cycle:               Array.isArray(cloudPayload.cycle) ? cloudPayload.cycle : prev.cycle,
-                cycleRoundsCompleted: Number(cloudPayload.cycleRoundsCompleted) || prev.cycleRoundsCompleted,
-                customDisciplines:   Array.isArray(cloudPayload.customDisciplines) ? cloudPayload.customDisciplines : prev.customDisciplines,
-                customMetas:         Object.assign({}, prev.customMetas, cloudPayload.customMetas || {}),
-              };
-            });
-          }
-        });
+        syncFromCloud(user);
       }
     });
 
-    // Listener de mudanças de autenticação
-    const unsubscribe = supabaseOnAuthChange(user => {
+    // Listener de login / logout
+    const unsubscribe = supabaseOnAuthChange((user, event) => {
       setCurrentUser(user);
       setAuthLoading(false);
+      if (user && event === 'SIGNED_IN') {
+        syncFromCloud(user);
+      }
     });
     return unsubscribe;
   }, []);
 
-  // Persistência dupla: localStorage (sempre) + Supabase (se logado, com debounce)
+  // Persistência: localStorage (sempre) + Supabase (se logado e não estiver sincronizando da nuvem)
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
     catch (e) { console.error('Erro ao salvar no localStorage', e); }
 
-    if (currentUser) {
+    if (currentUser && !isSyncingFromCloudRef.current) {
       setSyncStatus('syncing');
-      // debouncedSaveToCloud agenda o save; o status é atualizado dentro do debounce
-      debouncedSaveToCloud(currentUser.id, state, setSyncStatus);
+      debouncedSaveToCloud(currentUser.id, state, (res) => {
+        setSyncStatus(res && res.ok ? 'saved' : 'error');
+      });
     }
   }, [state, currentUser]);
 
+  // Auto-sincronização no servidor a cada 5 minutos e snapshot de backup periódico
+  useEffect(() => {
+    if (!currentUser) return;
+    const timer = setInterval(() => {
+      if (!isSyncingFromCloudRef.current && hasMeaningfulData(state)) {
+        setSyncStatus('syncing');
+        saveStateToCloud(currentUser.id, state).then(res => {
+          setSyncStatus(res && res.ok ? 'saved' : 'error');
+        });
+        maybeBackupToCloud(currentUser.id, state, 'autosync_5min', 60);
+      }
+    }, 5 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [currentUser, state]);
 
-
-  const editalSyllabus = useMemo(() => {
-    const customsWithTopics = (state.customDisciplines || []).filter(d => d.topics && d.topics.length > 0);
-    return [...INITIAL_SYLLABUS, ...customsWithTopics];
-  }, [state.customDisciplines]);
-
-  const allStudyDisciplines = useMemo(() => {
+  // ── Catálogo de Disciplinas (mantém histórico mesmo de matérias deletadas) ──
+  const allKnownDisciplines = useMemo(() => {
     return [...INITIAL_SYLLABUS, ...(state.customDisciplines || []), ...BUILTIN_EXTRA_DISCIPLINES];
   }, [state.customDisciplines]);
+
+  const deletedDisciplinesList = useMemo(() => {
+    const delSet = new Set(state.deletedDisciplineIds || []);
+    return allKnownDisciplines.filter(d => delSet.has(d.id));
+  }, [allKnownDisciplines, state.deletedDisciplineIds]);
+
+  const allStudyDisciplines = useMemo(() => {
+    const delSet = new Set(state.deletedDisciplineIds || []);
+    return allKnownDisciplines.filter(d => !delSet.has(d.id));
+  }, [allKnownDisciplines, state.deletedDisciplineIds]);
+
+  const editalSyllabus = useMemo(() => {
+    const delSet = new Set(state.deletedDisciplineIds || []);
+    const customsWithTopics = (state.customDisciplines || []).filter(d => d.topics && d.topics.length > 0);
+    return [...INITIAL_SYLLABUS, ...customsWithTopics].filter(d => !delSet.has(d.id));
+  }, [state.customDisciplines, state.deletedDisciplineIds]);
+
+  // ── Ciclo de Estudos Derivado (recalcula estornos perfeitamente ao excluir atividades) ──
+  const cycleView = useMemo(() => {
+    return computeCycleProgress(state.cycle || [], state.activities || [], state.cycleRoundsCompleted || 0);
+  }, [state.cycle, state.activities, state.cycleRoundsCompleted]);
 
   const onTopicChange = useCallback((tid, newData) => {
     setState(prev => {
@@ -2804,63 +3820,77 @@ function App() {
 /* Geração e compartilhamento no formato Instagram Story (9:16) com html-to-image */
   const handleExportStory = () => {
     const el = document.getElementById('instagram-story-template');
-    if (!el || typeof htmlToImage === 'undefined') {
-      alert('Biblioteca de captura indisponível no momento.');
+    if (!el) {
+      alert('Template do Story não encontrado.');
       return;
     }
 
-    const execute = () => {
-      htmlToImage.toPng(el, {
-        pixelRatio: 2.4, // 450x800 * 2.4 = 1080x1920px (9:16 nativo)
-        cacheBust: true,
-        backgroundColor: '#132038',
-        style: {
-          visibility: 'visible',
-          opacity: '1'
-        }
-      })
-      .then((dataUrl) => {
-        const fileName = 'story_estudos_tcu_' + customStart + '_a_' + customEnd + '.png';
+    setStoryLoading(true);
 
-        // Tenta partilhar nativamente no telemóvel
-        if (navigator.canShare && typeof File !== 'undefined') {
-          try {
-            fetch(dataUrl)
-              .then(res => res.blob())
-              .then(blob => {
-                const file = new File([blob], fileName, { type: 'image/png' });
-                if (navigator.canShare({ files: [file] })) {
-                  navigator.share({
-                    files: [file],
-                    title: 'Meus Estudos TCU - AFCE',
-                  }).catch(() => {});
-                  return;
-                }
-                const link = document.createElement('a');
-                link.download = fileName;
-                link.href = dataUrl;
-                link.click();
-              });
+    const saveBlobOrDownload = (blob, dataUrl) => {
+      const examName = (state.settings && state.settings.targetExam) || 'Estudos';
+      const cleanExam = normalize(examName).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+      const fileName = 'story_' + cleanExam + '_' + customStart + '_a_' + customEnd + '.png';
+
+      if (navigator.canShare && typeof File !== 'undefined' && blob) {
+        try {
+          const file = new File([blob], fileName, { type: 'image/png' });
+          if (navigator.canShare({ files: [file] })) {
+            navigator.share({
+              files: [file],
+              title: (state.settings && state.settings.targetRole) || 'Controle de Estudos',
+            }).catch(() => {});
+            setStoryLoading(false);
             return;
-          } catch (e) {}
-        }
+          }
+        } catch (e) {}
+      }
 
-        // Download no PC
-        const link = document.createElement('a');
-        link.download = fileName;
-        link.href = dataUrl;
-        link.click();
-      })
-      .catch((err) => {
-        console.error('Erro ao gerar Story:', err);
-        alert('Erro ao gerar Story.');
-      });
+      const link = document.createElement('a');
+      link.download = fileName;
+      link.href = dataUrl;
+      link.click();
+      setStoryLoading(false);
     };
 
-    if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(execute);
+    // Prioriza html2canvas por suportar canvas já renderizado, fontes e cores sem bloqueio CORS
+    if (typeof html2canvas !== 'undefined') {
+      html2canvas(el, {
+        scale: 2.4, // 450x800 * 2.4 = 1080x1920 px (9:16 nativo)
+        backgroundColor: '#132038',
+        useCORS: true,
+        allowTaint: true,
+        logging: false,
+      }).then(canvas => {
+        canvas.toBlob(blob => {
+          saveBlobOrDownload(blob, canvas.toDataURL('image/png'));
+        }, 'image/png');
+      }).catch(err => {
+        console.warn('html2canvas falhou no Story, tentando htmlToImage...', err);
+        if (typeof htmlToImage !== 'undefined') {
+          htmlToImage.toPng(el, { pixelRatio: 2.4, cacheBust: true, backgroundColor: '#132038' })
+            .then(dataUrl => saveBlobOrDownload(null, dataUrl))
+            .catch(e => {
+              console.error('Erro ao gerar Story:', e);
+              alert('Erro ao gerar Story.');
+              setStoryLoading(false);
+            });
+        } else {
+          alert('Erro ao gerar Story.');
+          setStoryLoading(false);
+        }
+      });
+    } else if (typeof htmlToImage !== 'undefined') {
+      htmlToImage.toPng(el, { pixelRatio: 2.4, cacheBust: true, backgroundColor: '#132038' })
+        .then(dataUrl => saveBlobOrDownload(null, dataUrl))
+        .catch(e => {
+          console.error('Erro ao gerar Story:', e);
+          alert('Erro ao gerar Story.');
+          setStoryLoading(false);
+        });
     } else {
-      setTimeout(execute, 100);
+      alert('Bibliotecas de captura indisponíveis.');
+      setStoryLoading(false);
     }
   };
 
@@ -2909,165 +3939,96 @@ function App() {
     });
   }, []);
 
-  const onDeleteCustomDiscipline = useCallback((disciplineId) => {
-    setState(prev => {
-      const updatedCustoms = (prev.customDisciplines || []).filter(d => d.id !== disciplineId);
-      const updatedCycle = (prev.cycle || []).filter(s => s.disciplineId !== disciplineId);
-      return Object.assign({}, prev, {
-        customDisciplines: updatedCustoms,
-        cycle: updatedCycle,
-      });
-    });
-  }, []);
-
+  // ── Handlers de Atividade com Ciclo Derivado (recalcula estornos perfeitamente) ──
   const onSaveActivity = useCallback((activity) => {
+    const chosenStepId = resolveStepForActivity(cycleView, activity, allStudyDisciplines);
     const record = Object.assign({
       id: 'act_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
       date: activity.date || todayStr(),
       createdAt: Date.now(),
+      cycleRound: state.cycleRoundsCompleted || 0,
+      stepId: chosenStepId,
     }, activity);
 
-    setState(prev => {
-      const newActivities = (prev.activities || []).concat([record]);
-      let updatedCycle = (prev.cycle || []).slice();
-
-      const discObj = allStudyDisciplines.find(d => d.id === record.disciplineId);
-      const hasTopics = discObj && discObj.topics && discObj.topics.length > 0;
-
-      if (hasTopics && updatedCycle.length > 0) {
-        let targetStepIdx = -1;
-
-        if (record.stepId) {
-          targetStepIdx = updatedCycle.findIndex(s => s.id === record.stepId);
-        }
-        if (targetStepIdx === -1) {
-          targetStepIdx = updatedCycle.findIndex(s =>
-            s.disciplineId === record.disciplineId && (s.studiedSeconds || 0) < (s.targetMinutes * 60)
-          );
-        }
-        if (targetStepIdx === -1) {
-          for (let i = updatedCycle.length - 1; i >= 0; i--) {
-            if (updatedCycle[i].disciplineId === record.disciplineId) {
-              targetStepIdx = i;
-              break;
-            }
-          }
-        }
-
-        if (targetStepIdx !== -1) {
-          record.stepId = updatedCycle[targetStepIdx].id;
-          const currentStep = updatedCycle[targetStepIdx];
-          updatedCycle[targetStepIdx] = Object.assign({}, currentStep, {
-            studiedSeconds: (currentStep.studiedSeconds || 0) + (record.seconds || 0),
-          });
-        }
-      }
-
-      return Object.assign({}, prev, {
-        activities: newActivities,
-        cycle: updatedCycle,
-      });
-    });
-  }, [allStudyDisciplines]);
+    setState(prev => Object.assign({}, prev, {
+      activities: (prev.activities || []).concat([record]),
+    }));
+  }, [cycleView, allStudyDisciplines, state.cycleRoundsCompleted]);
 
   const onEditActivity = useCallback((updatedActivity) => {
-      setState(prev => {
-        const oldAct = (prev.activities || []).find(a => a.id === updatedActivity.id);
-        if (!oldAct) return prev;
-
-        let updatedCycle = (prev.cycle || []).slice();
-
-        // 1. Reverte o tempo anterior do ciclo se estava vinculado
-        if (oldAct.stepId && updatedCycle.length > 0) {
-          const oldStepIdx = updatedCycle.findIndex(s => s.id === oldAct.stepId);
-          if (oldStepIdx !== -1) {
-            const curStep = updatedCycle[oldStepIdx];
-            updatedCycle[oldStepIdx] = Object.assign({}, curStep, {
-              studiedSeconds: Math.max(0, (curStep.studiedSeconds || 0) - (oldAct.seconds || 0)),
-            });
-          }
-        }
-
-        // 2. Aplica o novo tempo se a matéria possui tópicos
-        const discObj = allStudyDisciplines.find(d => d.id === updatedActivity.disciplineId);
-        const hasTopics = discObj && discObj.topics && discObj.topics.length > 0;
-
-        if (hasTopics && updatedCycle.length > 0) {
-          let targetStepIdx = -1;
-          if (updatedActivity.stepId) {
-            targetStepIdx = updatedCycle.findIndex(s => s.id === updatedActivity.stepId);
-          }
-          if (targetStepIdx === -1) {
-            targetStepIdx = updatedCycle.findIndex(s =>
-              s.disciplineId === updatedActivity.disciplineId && (s.studiedSeconds || 0) < (s.targetMinutes * 60)
-            );
-          }
-          if (targetStepIdx === -1) {
-            for (let i = updatedCycle.length - 1; i >= 0; i--) {
-              if (updatedCycle[i].disciplineId === updatedActivity.disciplineId) {
-                targetStepIdx = i;
-                break;
-              }
-            }
-          }
-
-          if (targetStepIdx !== -1) {
-            updatedActivity.stepId = updatedCycle[targetStepIdx].id;
-            const curStep = updatedCycle[targetStepIdx];
-            updatedCycle[targetStepIdx] = Object.assign({}, curStep, {
-              studiedSeconds: (curStep.studiedSeconds || 0) + (updatedActivity.seconds || 0),
-            });
-          } else {
-            updatedActivity.stepId = null;
-          }
-        } else {
-          updatedActivity.stepId = null;
-        }
-
-        // 3. Atualiza no array preservando o timestamp de criação original
-        const newActivities = (prev.activities || []).map(a =>
-          a.id === updatedActivity.id ? Object.assign({}, a, updatedActivity) : a
-        );
-
-        return Object.assign({}, prev, {
-          activities: newActivities,
-          cycle: updatedCycle,
-        });
-      });
-    }, [allStudyDisciplines]);
+    setState(prev => {
+      const newActivities = (prev.activities || []).map(a =>
+        a.id === updatedActivity.id ? Object.assign({}, a, updatedActivity) : a
+      );
+      return Object.assign({}, prev, { activities: newActivities });
+    });
+  }, []);
 
   const onDeleteActivity = useCallback((id) => {
-    setState(prev => {
-      const act = (prev.activities || []).find(a => a.id === id);
-      let updatedCycle = (prev.cycle || []).slice();
-
-      if (act && act.stepId && updatedCycle.length > 0) {
-        const stepIdx = updatedCycle.findIndex(s => s.id === act.stepId);
-        if (stepIdx !== -1) {
-          const currentStep = updatedCycle[stepIdx];
-          updatedCycle[stepIdx] = Object.assign({}, currentStep, {
-            studiedSeconds: Math.max(0, (currentStep.studiedSeconds || 0) - (act.seconds || 0)),
-          });
-        }
-      }
-
-      return Object.assign({}, prev, {
-        activities: (prev.activities || []).filter(a => a.id !== id),
-        cycle: updatedCycle,
-      });
-    });
+    // Ao deletar uma atividade, o ciclo recalculado imediatamente estorna os minutos
+    setState(prev => Object.assign({}, prev, {
+      activities: (prev.activities || []).filter(a => a.id !== id),
+    }));
   }, []);
 
   const onCompleteCycle = useCallback(() => {
     setState(prev => Object.assign({}, prev, {
       cycleRoundsCompleted: (prev.cycleRoundsCompleted || 0) + 1,
-      cycle: (prev.cycle || []).map(step => Object.assign({}, step, { studiedSeconds: 0 })),
     }));
     setShowCompleteCycleConfirm(false);
   }, []);
 
   const onUpdateCycle = useCallback((newCycle) => {
     setState(prev => Object.assign({}, prev, { cycle: newCycle }));
+  }, []);
+
+  // ── Gerenciamento de Matérias (Excluir nativa ou customizada, restaurar) ──
+  const onDeleteDiscipline = useCallback((disciplineId) => {
+    setState(prev => {
+      const deleted = Array.from(new Set([...(prev.deletedDisciplineIds || []), disciplineId]));
+      const updatedCycle = (prev.cycle || []).filter(s => s.disciplineId !== disciplineId);
+      return Object.assign({}, prev, {
+        deletedDisciplineIds: deleted,
+        cycle: updatedCycle,
+      });
+    });
+  }, []);
+
+  const onRestoreDiscipline = useCallback((disciplineId) => {
+    setState(prev => {
+      const deleted = (prev.deletedDisciplineIds || []).filter(id => id !== disciplineId);
+      return Object.assign({}, prev, {
+        deletedDisciplineIds: deleted,
+      });
+    });
+  }, []);
+
+  // ── Importação de Atividades via .CSV ──────────────────────────────────
+  const onImportCSVData = useCallback((parsedResult) => {
+    setState(prev => {
+      const newActs = (prev.activities || []).concat(parsedResult.activities || []);
+      let newCustoms = (prev.customDisciplines || []).slice();
+      let newMetas = Object.assign({}, prev.customMetas || {});
+
+      (parsedResult.newDisciplines || []).forEach(nd => {
+        if (!newCustoms.some(c => c.id === nd.id)) {
+          newCustoms.push({ id: nd.id, name: nd.name, block: 'b1', topics: [] });
+        }
+        newMetas[nd.id] = { sigla: nd.sigla, color: nd.color };
+      });
+
+      return Object.assign({}, prev, {
+        activities: newActs,
+        customDisciplines: newCustoms,
+        customMetas: newMetas,
+      });
+    });
+  }, []);
+
+  const onSaveContestSettings = useCallback((newSettings) => {
+    setState(prev => Object.assign({}, prev, {
+      settings: Object.assign({}, prev.settings || {}, newSettings),
+    }));
   }, []);
 
   const handleStartStep = (step) => {
@@ -3407,8 +4368,8 @@ function App() {
   }, [state.activities, disciplineRows, editalSyllabus]);
 
   const activeStepObj = useMemo(() => {
-    return (state.cycle || []).find(s => s.id === activeCycleStepId) || null;
-  }, [state.cycle, activeCycleStepId]);
+    return (cycleView || []).find(s => s.id === activeCycleStepId) || null;
+  }, [cycleView, activeCycleStepId]);
 
   return (
     <div className="min-h-screen">
@@ -3416,9 +4377,21 @@ function App() {
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-7">
           <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
             <div>
-              <p className="text-brass-300 text-xs tracking-wide font-medium mb-1.5">Tribunal de Contas da União</p>
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <p className="text-brass-300 text-xs tracking-wide font-medium">
+                  {(state.settings && state.settings.targetExam) || 'Tribunal de Contas da União'}
+                </p>
+                <button
+                  onClick={() => setShowEditContestModal(true)}
+                  className="text-brass-400 hover:text-brass-200 text-xs px-2 py-0.5 rounded bg-ink-800 border border-ink-700 hover:border-brass-400/50 flex items-center gap-1 transition-colors"
+                  title="Alterar o nome do concurso e foco"
+                >
+                  <span>✏️</span>
+                  <span className="text-[10px] uppercase font-bold tracking-wider">Alterar Concurso</span>
+                </button>
+              </div>
               <h1 className="font-serif text-2xl sm:text-3xl font-semibold leading-tight">
-                Auditor Federal de Controle Externo
+                {(state.settings && state.settings.targetRole) || 'Controle de Estudos'}
               </h1>
               <p className="text-ink-200 text-sm mt-1.5 max-w-xl">
                 Edital verticalizado, Ciclo de estudos rastreável e gerenciador de matérias e cores.
@@ -3449,6 +4422,11 @@ function App() {
                 className="px-3.5 py-2.5 rounded-md bg-ink-800 hover:bg-ink-700 border border-ink-600 text-paper-100 text-sm font-medium transition-colors flex items-center gap-1.5"
                 title="Exportar todas as atividades de estudo para arquivo Excel (.csv)">
                 <span>📊</span> Exportar Excel
+              </button>
+              <button onClick={() => setShowWeeklyReportModal(true)}
+                className="px-3.5 py-2.5 rounded-md bg-ink-800 hover:bg-ink-700 border border-ink-600 text-paper-100 text-sm font-medium transition-colors flex items-center gap-1.5"
+                title="Visualizar resumo semanal e disparar e-mail de teste">
+                <span>✉️</span> Resumo Semanal
               </button>
               <button onClick={() => setShowSync(true)}
                 className="px-3.5 py-2.5 rounded-md bg-brass-500 hover:bg-brass-600 text-ink-950 text-sm font-semibold transition-colors flex items-center gap-1.5">
@@ -3711,7 +4689,7 @@ function App() {
         <>
         <section>
           <StudyCycleVisual
-            cycle={state.cycle || []}
+            cycle={cycleView}
             allDisciplines={editalSyllabus}
             customMetas={state.customMetas}
             cycleRoundsCompleted={state.cycleRoundsCompleted || 0}
@@ -3767,7 +4745,7 @@ function App() {
                   title="Exportar imagem diagramada para Instagram Stories (9:16)"
                 >
                   <span>📸</span>
-                  <span>Story (9:16)</span>
+                  <span>{storyLoading ? 'Gerando...' : 'Story (9:16)'}</span>
                 </button>
               </div>
             </div>
@@ -3971,6 +4949,11 @@ function App() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
+              <button onClick={() => setShowImportCSV(true)}
+                className="px-3.5 py-1.5 rounded bg-ink-800 hover:bg-ink-700 text-paper-100 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-2xs border border-ink-600"
+                title="Importar atividades a partir de um arquivo .csv">
+                <span>📤</span> Importar .csv
+              </button>
               <button onClick={() => setShowManualModal(true)}
                 className="px-3.5 py-1.5 rounded bg-ink-800 hover:bg-ink-700 text-paper-100 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-2xs">
                 <span>✍️</span> Lançar atividade
@@ -4008,7 +4991,7 @@ function App() {
 
 {/* ===================== TEMPLATE DO STORY (9:16 - 1080x1920) ===================== */}
       {/* Contêiner de corte: invisível visualmente para a página, mas 100% capturável pelo html-to-image */}
-      <div style={{ position: 'fixed', top: 0, left: 0, width: 0, height: 0, overflow: 'hidden', pointerEvents: 'none', zIndex: -1 }}>
+      <div style={{ position: 'fixed', left: '-9999px', top: '0px', width: '450px', height: '800px', pointerEvents: 'none', zIndex: -100 }}>
         <div
           id="instagram-story-template"
           style={{
@@ -4119,7 +5102,9 @@ function App() {
           {/* Rodapé */}
           <div style={{ height: '24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }} className="w-full text-[11.5px] text-ink-400 border-t border-ink-700/40 pt-2">
             <span style={{ whiteSpace: 'nowrap' }} className="font-serif italic text-brass-400 leading-none">Constância supera intensidade</span>
-            <span style={{ whiteSpace: 'nowrap' }} className="font-mono leading-none font-semibold">#TCUAFCE</span>
+            <span style={{ whiteSpace: 'nowrap' }} className="font-mono leading-none font-semibold">
+              {(state.settings && state.settings.targetExam ? ('#' + normalize(state.settings.targetExam).replace(/[^a-z0-9]/gi, '').toUpperCase().slice(0, 8)) : '#ESTUDOS')}
+            </span>
           </div>
         </div>
       </div>
@@ -4132,19 +5117,51 @@ function App() {
         />
       )}
 
+      {showEditContestModal && (
+        <EditContestModal
+          currentExam={state.settings ? state.settings.targetExam : ''}
+          currentRole={state.settings ? state.settings.targetRole : ''}
+          onSave={onSaveContestSettings}
+          onClose={() => setShowEditContestModal(false)}
+        />
+      )}
+
+      {showImportCSV && (
+        <ImportCSVModal
+          allDisciplines={allStudyDisciplines}
+          customMetas={state.customMetas}
+          existingActivities={state.activities}
+          onConfirmImport={onImportCSVData}
+          onClose={() => setShowImportCSV(false)}
+        />
+      )}
+
+      {showWeeklyReportModal && (
+        <WeeklyReportModal
+          activities={state.activities}
+          allDisciplines={allKnownDisciplines}
+          customMetas={state.customMetas}
+          contestName={state.settings ? state.settings.targetExam : ''}
+          userEmail={currentUser ? currentUser.email : ''}
+          onClose={() => setShowWeeklyReportModal(false)}
+        />
+      )}
+
       {showEditColors && (
         <EditColorsModal
           allDisciplines={allStudyDisciplines}
+          deletedDisciplines={deletedDisciplinesList}
           customMetas={state.customMetas}
           onUpdateColor={onUpdateColor}
-          onDeleteCustomDiscipline={onDeleteCustomDiscipline}
+          onDeleteDiscipline={onDeleteDiscipline}
+          onRestoreDiscipline={onRestoreDiscipline}
           onClose={() => setShowEditColors(false)}
         />
       )}
 
       {showManualModal && (
         <ManualActivityModal
-          cycle={state.cycle || []}
+          cycle={cycleView}
           allDisciplines={allStudyDisciplines}
           customMetas={state.customMetas}
           defaultDisciplineId={timerDiscipline}
@@ -4169,7 +5186,7 @@ function App() {
 
       {showCompleteCycleConfirm && (
         <ConfirmCompleteCycleModal
-          cycle={state.cycle || []}
+          cycle={cycleView}
           cycleRoundsCompleted={state.cycleRoundsCompleted || 0}
           onConfirm={onCompleteCycle}
           onCancel={() => setShowCompleteCycleConfirm(false)}
@@ -4181,7 +5198,7 @@ function App() {
       {editingActivity && (
         <EditActivityModal
           activity={editingActivity}
-          cycle={state.cycle || []}
+          cycle={cycleView}
           allDisciplines={allStudyDisciplines}
           customMetas={state.customMetas}
           onCancel={() => setEditingActivity(null)}
